@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.32.0] (2026-05-25)
+
+### Features
+
+* **api:** add `POST /public/agent/{uuid}/web-session` endpoint — API-key-authenticated route that creates a SmallWebRTC session and returns a short-lived session token, `ws_url`, and TURN credentials so an external web app can connect a browser directly to a Dograh voice agent without telephony.
+
+### Details
+
+New endpoint in `api/routes/public_agent.py`:
+- Accepts `X-API-Key` header and an optional `initial_context` body
+- Resolves trigger UUID → workflow with the same org-scoping and active checks as the existing phone-call trigger
+- Performs quota check before creating a run
+- Creates a `smallwebrtc` workflow run and an embed session (1-hour expiry)
+- Returns `{ run_id, session_token, ws_url, turn_credentials }` — the frontend opens the WebSocket at `ws_url` to start the WebRTC handshake
+
+No DB migrations or new service files required. The existing `/ws/public/signaling/{session_token}` WebSocket handles the offer/answer/ICE exchange.
+
+---
+
 ## [1.31.0](https://github.com/dograh-hq/dograh/compare/dograh-v1.30.1...dograh-v1.31.0) (2026-05-21)
 
 
