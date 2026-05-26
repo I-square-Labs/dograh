@@ -1,11 +1,13 @@
 """Public API endpoints for public agent execution.
 
 These endpoints are accessible with API key authentication and allow
-external systems to programmatically trigger phone calls.
+external systems to programmatically trigger phone calls or browser-based
+WebRTC sessions.
 """
 
 import random
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -13,7 +15,9 @@ from loguru import logger
 from pydantic import BaseModel
 
 from api.db import db_client
-from api.enums import TriggerState, WorkflowStatus
+from api.enums import TriggerState, WorkflowRunMode, WorkflowStatus
+from api.routes.public_embed import generate_session_token
+from api.routes.turn_credentials import TURN_SECRET, generate_turn_credentials
 from api.services.quota_service import check_dograh_quota_by_user_id
 from api.services.telephony.factory import (
     get_default_telephony_provider,
@@ -405,4 +409,110 @@ async def initiate_call_test_by_workflow_uuid(
         x_api_key,
         use_draft=True,
         target_resolver=_resolve_workflow_uuid_target,
+    )
+
+
+class WebSessionRequest(BaseModel):
+    """Request model for creating a browser-based WebRTC session."""
+
+    initial_context: Optional[dict] = None
+
+
+class WebSessionResponse(BaseModel):
+    """Response model for a browser-based WebRTC session."""
+
+    run_id: int
+    session_token: str
+    ws_url: str
+    turn_credentials: Optional[dict] = None
+
+
+@router.post("/{uuid}/web-session", response_model=WebSessionResponse)
+async def trigger_web_session(
+    uuid: str,
+    body: WebSessionRequest,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Create a browser-based (SmallWebRTC) voice session for the published agent.
+
+    Returns a session token the caller's frontend uses to open
+    /ws/public/signaling/{session_token} and perform the WebRTC handshake.
+    """
+    api_key = await _validate_api_key(x_api_key)
+
+    target = await _resolve_trigger_target(
+        uuid,
+        api_key.organization_id,
+        use_draft=False,
+    )
+
+    execution_user_id = _get_execution_user_id(target.workflow)
+
+    quota_result = await check_dograh_quota_by_user_id(
+        execution_user_id, workflow_id=target.workflow.id
+    )
+    if not quota_result.has_quota:
+        raise HTTPException(status_code=402, detail=quota_result.error_message)
+
+    # The public signaling WebSocket resolves user and workflow_id through an
+    # embed token anchored to the session.  Reuse the workflow's existing active
+    # embed token; create a minimal one (no domain restrictions, no usage cap)
+    # if the workflow has not been set up with an embed widget yet.
+    tokens = await db_client.get_embed_tokens_by_workflow(
+        target.workflow.id, target.organization_id, active_only=True
+    )
+    if tokens:
+        embed_token = tokens[0]
+    else:
+        embed_token = await db_client.create_embed_token(
+            workflow_id=target.workflow.id,
+            organization_id=target.organization_id,
+            created_by=execution_user_id,
+        )
+
+    initial_context = {
+        "trigger_mode": "production",
+        "agent_uuid": uuid,
+        "api_key_id": api_key.id,
+    }
+    initial_context.update(body.initial_context or {})
+
+    workflow_run = await db_client.create_workflow_run(
+        name=f"WR-API-WEB-{random.randint(1000, 9999)}",
+        workflow_id=target.workflow.id,
+        mode=WorkflowRunMode.SMALLWEBRTC.value,
+        user_id=execution_user_id,
+        initial_context=initial_context,
+        organization_id=target.organization_id,
+    )
+
+    session_token = generate_session_token()
+    await db_client.create_embed_session(
+        session_token=session_token,
+        embed_token_id=embed_token.id,
+        workflow_run_id=workflow_run.id,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    _, wss_endpoint = await get_backend_endpoints()
+    ws_url = f"{wss_endpoint}/ws/public/signaling/{session_token}"
+
+    turn_credentials = None
+    if TURN_SECRET:
+        try:
+            creds = generate_turn_credentials(f"api:{api_key.id}")
+            turn_credentials = creds
+        except Exception as e:
+            logger.warning(f"Failed to generate TURN credentials for web session: {e}")
+
+    logger.info(
+        f"Created web session run {workflow_run.id} for trigger {uuid} "
+        f"(org={target.organization_id})"
+    )
+
+    return WebSessionResponse(
+        run_id=workflow_run.id,
+        session_token=session_token,
+        ws_url=ws_url,
+        turn_credentials=turn_credentials,
     )
