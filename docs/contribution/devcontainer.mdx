@@ -48,6 +48,54 @@ Run a one-off command from the host:
 devcontainer exec --workspace-folder . bash scripts/start_services_dev.sh
 ```
 
+### Port Forwarding & Localhost Access
+
+The devcontainer forwards six ports from the container to your host machine so you can reach all services at `localhost` without any extra configuration:
+
+| Port | Service | localhost URL |
+|------|---------|--------------|
+| `3000` | Dograh UI (Next.js) | `http://localhost:3000` |
+| `8000` | Dograh API (FastAPI) | `http://localhost:8000` |
+| `5432` | PostgreSQL | `localhost:5432` |
+| `6379` | Redis | `localhost:6379` |
+| `9000` | MinIO API | `http://localhost:9000` |
+| `9001` | MinIO Console | `http://localhost:9001` |
+
+**Why the UI must bind to `0.0.0.0`**
+
+Next.js defaults to listening only on `127.0.0.1` inside the container. Port forwarding works by proxying traffic from your host's `localhost` into the container, but a service that is only bound to the container-internal loopback (`127.0.0.1`) is unreachable through that proxy. Starting the dev server with `--hostname 0.0.0.0` makes it listen on all container interfaces, which is what the port forward needs:
+
+```bash
+cd ui
+npm run dev -- --hostname 0.0.0.0
+```
+
+The API (uvicorn) is already started with `--host 0.0.0.0` by `scripts/start_services_dev.sh`, so no extra flag is needed there.
+
+**Verifying the ports are forwarded**
+
+After starting both services, open the VS Code **Ports** panel (`Ctrl+Shift+P` → *Ports: Focus on Ports View*). You should see `Dograh UI (3000)` and `Dograh API (8000)` listed as forwarded. If they are missing, right-click → *Add Port* and enter `3000` or `8000`.
+
+Quick smoke test from your host terminal:
+
+```bash
+# API health
+curl http://localhost:8000/api/v1/health
+
+# UI (expects a 200 or 307 redirect)
+curl -o /dev/null -w "%{http_code}" http://localhost:3000
+```
+
+**Troubleshooting**
+
+| Symptom | Fix |
+|---------|-----|
+| `curl: (7) Failed to connect to localhost port 3000` | UI was started without `--hostname 0.0.0.0`. Stop and restart with the flag. |
+| Port 3000 shows `127.0.0.1` in the Ports panel | Same issue — restart the UI with `--hostname 0.0.0.0`. |
+| Port 8000 or 3000 not listed in the Ports panel after starting | Add them manually: VS Code Ports panel → *Add Port* → enter the port number. |
+| Connection refused on port 8000 | API server not running. Start it: `bash scripts/start_services_dev.sh`. |
+| `forwardPorts` changes not picked effect | `devcontainer.json` is only read at container start. Rebuild the container: *Dev Containers: Rebuild Container*. |
+
 ### Backend Logs
 
 Tail backend logs from inside the container:
